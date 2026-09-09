@@ -37,6 +37,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <poll.h>
 #include <unistd.h>
 #include <errno.h>
 #include <stdlib.h>
@@ -52,8 +53,16 @@
 #include "ctlsock.h"
 extern "C" int amiga_send_input_event(int input_event, int state);
 
+/* uae_quit() is only reachable with C++ linkage (src/main.cpp); native.c is a
+ * plain C translation unit and cannot call it directly, so it calls this
+ * wrapper instead. See src/fs-uae/native.c's SIGTERM handling. */
+extern "C" void fsuae_native_quit(void);
+
 #include <deque>
+#include <map>
 #include <string>
+#include <vector>
+#include <utility>
 
 #define CTL_PROTO "mamectl/1"
 
@@ -63,13 +72,36 @@ extern "C" int amiga_send_input_event(int input_event, int state);
 extern int g_fsuae_ctl_crop_x, g_fsuae_ctl_crop_y;
 extern int g_fsuae_ctl_crop_w, g_fsuae_ctl_crop_h;
 
+/*
+ * MULTI-CLIENT (kernel-hive native-fixes #1)
+ * -------------------------------------------
+ * The original listener served exactly one client fd: a second connection
+ * (e.g. `labctl mctl` alongside `labctl type`) silently stole the slot from
+ * whichever client held it, and the orphaned client's writes/reads wedged
+ * until it timed out. MAME's ctlsock module serves N concurrent clients, each
+ * with its own HELLO and ack stream; verbs from every client drain through
+ * the same per-frame queue, in arrival order, and an ack is routed back only
+ * to the client that sent that command. A disconnect of one client never
+ * touches another's fd or generation.
+ *
+ * The reader thread now polls the listener plus every client fd in one
+ * poll(2) loop and keeps a small std::vector<Client> (guarded by g_lock, same
+ * as before) instead of a single fd/generation pair. Partial line buffers are
+ * kept in a std::map<fd,string> local to the reader thread, so no lock is
+ * needed for that part -- only the reader thread ever touches it.
+ */
+struct Client {
+    int fd;
+    unsigned gen;
+};
+
 static int g_enabled = -1;
 static int g_started = 0;
 static int g_listen_fd = -1;
-static int g_client_fd = -1;          /* written by the reader thread only */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static std::deque<std::string> g_queue;   /* guarded by g_lock */
-static unsigned g_generation = 0;         /* guarded by g_lock; bumped on connect */
+static std::deque<std::pair<unsigned, std::string> > g_queue;  /* (gen, line); guarded by g_lock */
+static unsigned g_generation = 0;         /* guarded by g_lock; bumped on connect/disconnect */
+static std::vector<Client> g_clients;     /* guarded by g_lock */
 
 /* Deferred LOADST ack: restore_state() only *arms* the restore. */
 static int g_restore_pending = 0;
@@ -80,6 +112,15 @@ static unsigned g_restore_gen = 0;
 static int g_buttons = 0;
 static int g_last_x = -1, g_last_y = -1;
 static unsigned long long g_applied = 0;
+
+/* See the extern "C" declaration above: native.c (a C translation unit)
+ * cannot call the C++-mangled uae_quit() (src/main.cpp) directly, so it goes
+ * through this wrapper instead. Used by the SIGTERM handling in
+ * src/fs-uae/native.c (kernel-hive native-fixes #2). */
+void fsuae_native_quit(void)
+{
+    uae_quit();
+}
 
 int fsuae_ctlsock_enabled(void)
 {
@@ -100,14 +141,23 @@ static int trace_on(void)
     return t;
 }
 
-/* Write on the client fd. Called from BOTH threads; fd writes are small and
- * ordered under g_lock by every caller. */
+/* Write to the client fd owning generation `gen`, if it is still connected.
+ * Called from BOTH threads; every caller holds g_lock, so the g_clients scan
+ * and the write below are atomic with respect to a concurrent connect or
+ * disconnect. */
 static void ctl_write_locked(unsigned gen, const char *s)
 {
-    if (g_client_fd < 0 || gen != g_generation)
+    int fd = -1;
+    for (size_t i = 0; i < g_clients.size(); i++) {
+        if (g_clients[i].gen == gen) {
+            fd = g_clients[i].fd;
+            break;
+        }
+    }
+    if (fd < 0)
         return;
     size_t n = strlen(s);
-    ssize_t w = write(g_client_fd, s, n);
+    ssize_t w = write(fd, s, n);
     if (w < 0 && errno != EINTR && errno != EAGAIN) {
         /* peer gone; the reader thread will notice on its next read */
     }
@@ -263,36 +313,112 @@ static void send_hello(unsigned gen)
     ctl_write_locked(gen, buf);
 }
 
+/* Remove and close one client by fd. Caller must NOT hold g_lock. */
+static void drop_client(int fd, std::map<int, std::string> *partial)
+{
+    unsigned gen = 0;
+    pthread_mutex_lock(&g_lock);
+    for (size_t i = 0; i < g_clients.size(); i++) {
+        if (g_clients[i].fd == fd) {
+            gen = g_clients[i].gen;
+            g_clients.erase(g_clients.begin() + i);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    close(fd);
+    partial->erase(fd);
+    write_log("[fsuae-ctl] client disconnected (gen %u)\n", gen);
+}
+
 static void *reader_thread(void *ignored)
 {
     (void) ignored;
+    std::map<int, std::string> partial;   /* per-client partial line, reader-thread-only */
+    std::vector<struct pollfd> pfds;
+
     for (;;) {
-        int fd = accept(g_listen_fd, NULL, NULL);
-        if (fd < 0) {
+        pfds.clear();
+        struct pollfd lfd;
+        lfd.fd = g_listen_fd;
+        lfd.events = POLLIN;
+        lfd.revents = 0;
+        pfds.push_back(lfd);
+
+        pthread_mutex_lock(&g_lock);
+        for (size_t i = 0; i < g_clients.size(); i++) {
+            struct pollfd p;
+            p.fd = g_clients[i].fd;
+            p.events = POLLIN;
+            p.revents = 0;
+            pfds.push_back(p);
+        }
+        pthread_mutex_unlock(&g_lock);
+
+        int n = poll(&pfds[0], pfds.size(), 1000);
+        if (n < 0) {
             if (errno == EINTR)
                 continue;
-            write_log("[fsuae-ctl] accept: %s\n", strerror(errno));
+            write_log("[fsuae-ctl] poll: %s\n", strerror(errno));
             break;
         }
-        pthread_mutex_lock(&g_lock);
-        g_client_fd = fd;
-        g_generation++;
-        unsigned gen = g_generation;
-        g_queue.clear();
-        send_hello(gen);
-        pthread_mutex_unlock(&g_lock);
-        write_log("[fsuae-ctl] client connected (gen %u)\n", gen);
+        if (n == 0)
+            continue;
 
-        std::string buf;
-        char chunk[1024];
-        for (;;) {
-            ssize_t n = read(fd, chunk, sizeof(chunk));
-            if (n <= 0) {
-                if (n < 0 && errno == EINTR)
-                    continue;
-                break;
+        if (pfds[0].revents & POLLIN) {
+            int fd = accept(g_listen_fd, NULL, NULL);
+            if (fd < 0) {
+                if (errno != EINTR)
+                    write_log("[fsuae-ctl] accept: %s\n", strerror(errno));
+            } else {
+                pthread_mutex_lock(&g_lock);
+                g_generation++;
+                unsigned gen = g_generation;
+                Client c;
+                c.fd = fd;
+                c.gen = gen;
+                g_clients.push_back(c);
+                send_hello(gen);
+                pthread_mutex_unlock(&g_lock);
+                partial[fd] = "";
+                write_log("[fsuae-ctl] client connected (gen %u, %zu total)\n",
+                          gen, g_clients.size());
             }
-            buf.append(chunk, (size_t) n);
+        }
+
+        /* Snapshot which client fds are pending a disconnect below, without
+         * mutating g_clients while iterating pfds (indices 1..N mirror the
+         * g_clients snapshot taken above; a client added just now by the
+         * accept() branch is simply picked up on the next poll iteration). */
+        std::vector<int> to_drop;
+        for (size_t i = 1; i < pfds.size(); i++) {
+            if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)))
+                continue;
+            int fd = pfds[i].fd;
+            char chunk[1024];
+            ssize_t r = read(fd, chunk, sizeof(chunk));
+            if (r <= 0) {
+                if (r < 0 && errno == EINTR)
+                    continue;
+                to_drop.push_back(fd);
+                continue;
+            }
+            unsigned gen = 0;
+            pthread_mutex_lock(&g_lock);
+            for (size_t j = 0; j < g_clients.size(); j++) {
+                if (g_clients[j].fd == fd) {
+                    gen = g_clients[j].gen;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_lock);
+            if (gen == 0) {
+                /* Already dropped this pass (shouldn't happen, but be safe). */
+                continue;
+            }
+
+            std::string &buf = partial[fd];
+            buf.append(chunk, (size_t) r);
             size_t nl;
             while ((nl = buf.find('\n')) != std::string::npos) {
                 std::string line = buf.substr(0, nl);
@@ -303,17 +429,13 @@ static void *reader_thread(void *ignored)
                     continue;
                 pthread_mutex_lock(&g_lock);
                 if (g_queue.size() < 4096)
-                    g_queue.push_back(line);
+                    g_queue.push_back(std::make_pair(gen, line));
                 pthread_mutex_unlock(&g_lock);
             }
         }
-        pthread_mutex_lock(&g_lock);
-        g_client_fd = -1;
-        g_generation++;
-        g_queue.clear();
-        pthread_mutex_unlock(&g_lock);
-        close(fd);
-        write_log("[fsuae-ctl] client disconnected\n");
+        for (size_t i = 0; i < to_drop.size(); i++) {
+            drop_client(to_drop[i], &partial);
+        }
     }
     return NULL;
 }
@@ -346,7 +468,7 @@ static void ctlsock_start(void)
         abort();
     }
     chmod(path, 0666);
-    if (listen(g_listen_fd, 1) < 0) {
+    if (listen(g_listen_fd, 16) < 0) {
         write_log("[fsuae-ctl] FATAL: listen: %s\n", strerror(errno));
         abort();
     }
@@ -374,9 +496,9 @@ void fsuae_ctlsock_poll(void)
             pthread_mutex_unlock(&g_lock);
             break;
         }
-        line = g_queue.front();
+        gen = g_queue.front().first;
+        line = g_queue.front().second;
         g_queue.pop_front();
-        gen = g_generation;
         pthread_mutex_unlock(&g_lock);
 
         if (trace_on())
