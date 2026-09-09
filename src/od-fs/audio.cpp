@@ -7,6 +7,70 @@
 #include "audio.h"
 #include "uae/fs.h"
 
+// ---- native audio FIFO (FSUAE_NATIVE_AUDIO_FIFO) ---------------------------
+// Kernel-hive host-native stations have no OS audio device to bridge; the
+// streamhost daemon is the audio CLOCK on the far end of a named FIFO (see
+// streamhost/src/audio.rs "FIFO PCM source" and the irix launcher's
+// SDL-disk-driver contract, which this mirrors: s16le, 2ch, 48000 Hz). When
+// FSUAE_NATIVE_AUDIO_FIFO is unset every line below is a single getenv() call
+// on the emulation thread's audio path -- byte-identical behaviour otherwise.
+// When it is set, the write is O_NONBLOCK with drop-on-full and reopen-on-
+// EPIPE/error: the emulator must never block on a reader that stalls or is
+// absent, because the emulation thread is the Amiga's own clock, not the
+// FIFO's.
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+
+static int g_native_audio_fifo_fd = -1;
+static bool g_native_audio_fifo_checked = false;
+static const char *g_native_audio_fifo_path = NULL;
+
+static void native_audio_fifo_write(const void *buf, int size)
+{
+    if (!g_native_audio_fifo_checked) {
+        g_native_audio_fifo_checked = true;
+        g_native_audio_fifo_path = getenv("FSUAE_NATIVE_AUDIO_FIFO");
+    }
+    if (!g_native_audio_fifo_path || size <= 0) {
+        return;
+    }
+    if (g_native_audio_fifo_fd < 0) {
+        // Non-blocking open: with no reader attached yet this fails ENXIO
+        // (FIFO semantics for O_WRONLY|O_NONBLOCK) rather than blocking the
+        // emulation thread; we just retry on the next buffer.
+        g_native_audio_fifo_fd = open(g_native_audio_fifo_path,
+                                       O_WRONLY | O_NONBLOCK);
+        if (g_native_audio_fifo_fd < 0) {
+            return;
+        }
+    }
+    const uae_u8 *p = (const uae_u8 *) buf;
+    int remaining = size;
+    while (remaining > 0) {
+        ssize_t n = write(g_native_audio_fifo_fd, p, remaining);
+        if (n > 0) {
+            p += n;
+            remaining -= n;
+            continue;
+        }
+        if (n < 0 && errno == EAGAIN) {
+            // Reader (the daemon's paced FIFO clock) is behind or absent --
+            // drop the remainder of this buffer rather than block. The
+            // reader owns the pipe's F_SETPIPE_SZ and treats loss as
+            // silence, never as a reason to slow the producer down.
+            break;
+        }
+        // EPIPE (reader gone) or any other error: drop the fd and try to
+        // reopen on the next buffer -- never let a vanished reader wedge
+        // the emulation thread.
+        close(g_native_audio_fifo_fd);
+        g_native_audio_fifo_fd = -1;
+        break;
+    }
+}
+// -----------------------------------------------------------------------------
+
 int have_sound = 0;
 
 static float scaled_sample_evtime_orig;
@@ -61,6 +125,13 @@ int amiga_set_audio_buffer_size(int size)
 
 int amiga_set_audio_frequency(int frequency)
 {
+    if (getenv("FSUAE_NATIVE_AUDIO_FIFO")) {
+        // The FIFO reader (streamhost's audio.rs FIFO clock) is fixed at
+        // 48000 Hz s16le stereo by the launcher contract -- there is no
+        // Init() handshake on that side, so the producer rate cannot drift
+        // from what the reader assumes.
+        frequency = 48000;
+    }
     if (frequency == 0) {
         /* Some code divides by frequency, so 0 is not a good idea */
         write_log("WARNING: amiga_set_audio_frequency 0, set to 44100\n");
@@ -192,6 +263,7 @@ static void send_sound (struct sound_data *sd, uae_u16 *sndbuffer)
 	if (g_audio_callback) {
 		g_audio_callback(0, (int16_t *) paula_sndbuffer, paula_sndbufsize);
 	}
+	native_audio_fifo_write(paula_sndbuffer, paula_sndbufsize);
 }
 
 void finish_sound_buffer (void)
