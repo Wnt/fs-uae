@@ -29,9 +29,43 @@
  * FSUAE_NATIVE_SHM_TRACE=1 logs the mapping and a periodic publish counter to
  * stderr.
  *
- * THE FRAME still goes nowhere in this commit -- the render callback only
- * counts frames and reports the crop rectangle under the trace knob. The next
- * commit gives it the shared-memory publisher.
+ * WIRE FORMAT -- the one streamhost's consumer already speaks
+ * (streamhost/streamhost/src/capture/shm.rs). We copy the CONTRACT, not the
+ * code:
+ *
+ *   off  type  field
+ *     0  u32   magic 'IFB1' (0x31424649 little-endian)
+ *     4  u32   version (1)
+ *     8  u32   width
+ *    12  u32   height
+ *    16  u32   stride (bytes per row; always width*4 here)
+ *    20  u32   bpp (32)
+ *    24  u64   sequence (seqlock)
+ *    32  u32   dirty_x0   36 u32 dirty_y0
+ *    40  u32   dirty_x1   44 u32 dirty_y1
+ *    48        pad to 64
+ *    64        width*height pixels
+ *
+ * Pixels are already host-endian XRGB8888 in the core's buffer (g_amiga_video_bpp
+ * defaults to 4, src/od-fs/libamiga.cpp:43), which is byte-identical to the BGRA
+ * the encoder consumes. Nothing on this path converts a pixel; a conversion
+ * would eat the entire win.
+ *
+ * WHAT IS PUBLISHED is the CROP RECTANGLE (rd->limit_x/y/w/h normalized to
+ * hires/laced pixels exactly as src/fs-uae/video.c:469-475 does), not the full
+ * 572-line allocation. The crop is what a visitor sees, and it is the pixel
+ * space the daemon's absolute pointer is clamped to -- so publishing anything
+ * else would silently misregister the mouse later.
+ *
+ * SYNCHRONISATION is a seqlock: one producer (the UAE core thread, the only
+ * caller of the render callback), any number of readers, readers never write.
+ * The sequence goes ODD before pixels are touched and EVEN after, both with
+ * release ordering, so a torn frame can never be accepted.
+ *
+ * DAMAGE: whole-frame on every published frame. We have no cheaper truth here
+ * (the core gives us a line array, not a box), and the consumer's own frame diff
+ * (SH_SHM_DAMAGE=1, the default) derives the real bounding box on ITS core --
+ * the right side of the trade for a CPU-bound emulator.
  *
  * FRAME PACING: dropping libfsemu drops fs_emu_wait_for_frame(). Without a
  * replacement the guest free-runs at whatever speed the host can manage.
@@ -55,10 +89,18 @@
 
 #include <uae/uae.h>
 
+#define SHM_HEADER 64
+#define SHM_MAGIC 0x31424649u /* 'IFB1' */
+#define SHM_VERSION 1u
+
 static int g_enabled = -1;
 static const char *g_path = NULL;
 static int g_trace = 0;
 
+static uint8_t *g_shm = NULL;
+static size_t g_shm_size = 0;
+static int g_shm_w = 0;
+static int g_shm_h = 0;
 static uint64_t g_frames = 0;
 
 int fsuae_native_enabled(void)
@@ -77,6 +119,158 @@ const char *fsuae_native_shm_path(void)
 {
     fsuae_native_enabled();
     return g_path;
+}
+
+static void native_unmap(void)
+{
+    if (g_shm) {
+        munmap(g_shm, g_shm_size);
+    }
+    g_shm = NULL;
+    g_shm_size = 0;
+    g_shm_w = 0;
+    g_shm_h = 0;
+}
+
+/* (Re)map whenever the published geometry changes. The key is (w, h) and NOT
+ * the byte size: 720x568 and 568x720 need the same bytes, and a size-keyed test
+ * would keep publishing a transposed frame under a stale header forever.
+ *
+ * The order matters and matches what the consumer's validation expects: grow
+ * the file first, then zero the header -- which makes the magic invalid, so a
+ * reader looking mid-resize sees "not initialised yet" rather than a lie --
+ * then write the new geometry. */
+static int native_ensure_mapped(int w, int h)
+{
+    if (g_shm && g_shm_w == w && g_shm_h == h) {
+        return 1;
+    }
+    native_unmap();
+
+    size_t want = (size_t) SHM_HEADER + (size_t) w * (size_t) h * 4;
+    int fd = open(g_path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "[fsuae-shm] cannot open %s: %s\n", g_path, strerror(errno));
+        return 0;
+    }
+    void *p = MAP_FAILED;
+    if (ftruncate(fd, (off_t) want) == 0) {
+        p = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    }
+    close(fd);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "[fsuae-shm] cannot map %zu bytes of %s: %s\n",
+                want, g_path, strerror(errno));
+        return 0;
+    }
+
+    g_shm = (uint8_t *) p;
+    g_shm_size = want;
+    g_shm_w = w;
+    g_shm_h = h;
+
+    memset(g_shm, 0, SHM_HEADER);
+    uint32_t *hdr = (uint32_t *) g_shm;
+    hdr[0] = SHM_MAGIC;
+    hdr[1] = SHM_VERSION;
+    hdr[2] = (uint32_t) w;
+    hdr[3] = (uint32_t) h;
+    hdr[4] = (uint32_t) w * 4;
+    hdr[5] = 32;
+    if (g_trace) {
+        fprintf(stderr, "[fsuae-shm] mapped %dx%d (%zu bytes) at %s\n",
+                w, h, want, g_path);
+    }
+    return 1;
+}
+
+/* The crop rectangle the core wants shown, normalized to hires/laced pixels and
+ * clamped into the allocated buffer. Mirrors src/fs-uae/video.c:466-475; RTG
+ * (Picasso96) frames already arrive at their true size with both shifts zero. */
+static void native_crop(RenderData *rd, int *cx, int *cy, int *cw, int *ch)
+{
+    int hshift = (rd->flags & AMIGA_VIDEO_LOW_RESOLUTION) ? 1 : 0;
+    int vshift = (!(rd->flags & AMIGA_VIDEO_LINE_DOUBLING)) ? 1 : 0;
+
+    int x = rd->limit_x << hshift;
+    int w = rd->limit_w << hshift;
+    int y = rd->limit_y << vshift;
+    int h = rd->limit_h << vshift;
+
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (w <= 0 || x + w > rd->width) w = rd->width - x;
+    if (h <= 0 || y + h > rd->height) h = rd->height - y;
+    if (w < 0) w = 0;
+    if (h < 0) h = 0;
+
+    *cx = x;
+    *cy = y;
+    *cw = w;
+    *ch = h;
+}
+
+static double g_render_hz = 0.0;
+
+static void native_render(RenderData *rd)
+{
+    if (!g_path || rd == NULL || rd->pixels == NULL) {
+        return;
+    }
+    /* bpp is BYTES per pixel here (g_amiga_video_bpp, src/od-fs/libamiga.cpp:43).
+     * A 16-bit build would need a conversion we deliberately do not write: the
+     * whole point of this path is that no pixel is touched twice. */
+    if (rd->bpp != 4) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[fsuae-shm] refusing bpp=%d, need 4 (RGB32)\n", rd->bpp);
+        }
+        return;
+    }
+
+    if (rd->refresh_rate > 1.0 && rd->refresh_rate < 200.0) {
+        g_render_hz = rd->refresh_rate;
+    }
+
+    int cx, cy, cw, ch;
+    native_crop(rd, &cx, &cy, &cw, &ch);
+    if (cw <= 0 || ch <= 0) {
+        return;
+    }
+    if (!native_ensure_mapped(cw, ch)) {
+        return;
+    }
+
+    uint32_t *hdr = (uint32_t *) g_shm;
+    volatile uint64_t *seqp = (volatile uint64_t *) (g_shm + 24);
+    uint64_t start = *seqp;
+
+    __atomic_store_n((uint64_t *) (g_shm + 24), start + 1, __ATOMIC_RELEASE);
+
+    const size_t dst_row = (size_t) cw * 4;
+    const size_t src_stride = (size_t) rd->width * 4;
+    const uint8_t *src = rd->pixels + (size_t) cy * src_stride + (size_t) cx * 4;
+    uint8_t *dst = g_shm + SHM_HEADER;
+    for (int y = 0; y < ch; y++) {
+        memcpy(dst, src, dst_row);
+        dst += dst_row;
+        src += src_stride;
+    }
+
+    /* Whole-frame damage: see the file header. */
+    hdr[8] = 0;
+    hdr[9] = 0;
+    hdr[10] = (uint32_t) cw;
+    hdr[11] = (uint32_t) ch;
+
+    __atomic_store_n((uint64_t *) (g_shm + 24), start + 2, __ATOMIC_RELEASE);
+
+    g_frames++;
+    if (g_trace && (g_frames % 300) == 0) {
+        fprintf(stderr, "[fsuae-shm] published %llu frames %dx%d\n",
+                (unsigned long long) g_frames, cw, ch);
+    }
 }
 
 /* --- the render buffer ---------------------------------------------------
@@ -110,57 +304,6 @@ static void *native_grow(int width, int height)
         g_pix = p;
     }
     return g_pix;
-}
-
-/* The crop rectangle the core wants shown, normalized to hires/laced pixels and
- * clamped into the allocated buffer. Mirrors src/fs-uae/video.c:466-475; RTG
- * (Picasso96) frames already arrive at their true size with both shifts zero. */
-static void native_crop(RenderData *rd, int *cx, int *cy, int *cw, int *ch)
-{
-    int hshift = (rd->flags & AMIGA_VIDEO_LOW_RESOLUTION) ? 1 : 0;
-    int vshift = (!(rd->flags & AMIGA_VIDEO_LINE_DOUBLING)) ? 1 : 0;
-
-    int x = rd->limit_x << hshift;
-    int w = rd->limit_w << hshift;
-    int y = rd->limit_y << vshift;
-    int h = rd->limit_h << vshift;
-
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (w <= 0 || x + w > rd->width) w = rd->width - x;
-    if (h <= 0 || y + h > rd->height) h = rd->height - y;
-    if (w < 0) w = 0;
-    if (h < 0) h = 0;
-
-    *cx = x;
-    *cy = y;
-    *cw = w;
-    *ch = h;
-}
-
-static double g_render_hz = 0.0;
-
-/* Commit 1 consumes the frame without publishing it: this proves the core runs
- * headless and hands over a real, correctly-cropped RGB32 frame, and the next
- * commit replaces the body with the IFB1 shm publisher. */
-static void native_render(RenderData *rd)
-{
-    if (rd == NULL || rd->pixels == NULL) {
-        return;
-    }
-    if (rd->refresh_rate > 1.0 && rd->refresh_rate < 200.0) {
-        g_render_hz = rd->refresh_rate;
-    }
-    int cx, cy, cw, ch;
-    native_crop(rd, &cx, &cy, &cw, &ch);
-    if (cw <= 0 || ch <= 0) {
-        return;
-    }
-    g_frames++;
-    if (g_trace && (g_frames % 300) == 0) {
-        fprintf(stderr, "[fsuae-shm] frame %llu crop %dx%d+%d+%d bpp %d\n",
-                (unsigned long long) g_frames, cw, ch, cx, cy, rd->bpp);
-    }
 }
 
 /* The core also calls a "display" callback after render; with no window there is
