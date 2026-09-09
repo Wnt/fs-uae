@@ -530,6 +530,24 @@ int uae_slirp_redir(int is_udp, int host_port, struct in_addr guest_addr,
 		    int guest_port)
 {
 #ifdef WITH_NEW_SLIRP
+	/* kernel-hive: stock 3.2.35 leaves this a stub under the vendored
+	 * libslirp ("FIXME: Add redir functionality!"), so every slirp_redir /
+	 * slirp_ports line is parsed and then silently dropped. Forward it
+	 * through libslirp, bound to LOOPBACK ONLY: the forward exists so the
+	 * host can reach a guest service (the AMIX station's X server, for the
+	 * x11warp pointer), never so the LAN can. Fail-closed by construction. */
+	struct in_addr host_addr;
+	inet_pton(AF_INET, "127.0.0.1", &host_addr);
+	if (!slirp) {
+		uae_slirp_log("hostfwd refused: slirp not initialised\n");
+		return -1;
+	}
+	int rc = slirp_add_hostfwd(slirp, is_udp, host_addr, host_port,
+				   guest_addr, guest_port);
+	uae_slirp_log("hostfwd %s 127.0.0.1:%d -> %s:%d rc=%d\n",
+		      is_udp ? "udp" : "tcp", host_port, inet_ntoa(guest_addr),
+		      guest_port, rc);
+	return rc;
 #else
 #ifdef WITH_QEMU_SLIRP
 	if (impl == QEMU_IMPLEMENTATION) {
