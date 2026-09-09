@@ -21,10 +21,30 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 
 static int g_native_audio_fifo_fd = -1;
 static bool g_native_audio_fifo_checked = false;
 static const char *g_native_audio_fifo_path = NULL;
+// kernel-hive native-fixes #4: with O_WRONLY|O_NONBLOCK, open() on a FIFO
+// with no reader attached fails ENXIO immediately (see the comment below) --
+// so before this throttle existed, every single audio buffer produced while
+// the daemon's FIFO reader had not (yet) opened its end retried open()
+// again, once per buffer (roughly once per video frame while the guest is
+// idle and the reader is between attach cycles). That is the churn the
+// daemon's log line "[audio] fifo open:" was counting. Retry at most every
+// 500ms instead: a reader that is merely slow to attach is not worth a busy
+// loop, and once opened the fd is kept for the life of the process (or until
+// EPIPE, below) -- there is no per-write open/close on the happy path, then
+// or now.
+static long long g_native_audio_fifo_last_attempt_ns = 0;
+
+static long long native_audio_fifo_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long) ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
 
 static void native_audio_fifo_write(const void *buf, int size)
 {
@@ -36,9 +56,18 @@ static void native_audio_fifo_write(const void *buf, int size)
         return;
     }
     if (g_native_audio_fifo_fd < 0) {
+        long long now = native_audio_fifo_now_ns();
+        if (g_native_audio_fifo_last_attempt_ns != 0 &&
+            now - g_native_audio_fifo_last_attempt_ns < 500000000LL) {
+            // Retried too recently (no reader yet, most likely ENXIO): drop
+            // this buffer's worth of audio rather than hammer open(2).
+            return;
+        }
+        g_native_audio_fifo_last_attempt_ns = now;
         // Non-blocking open: with no reader attached yet this fails ENXIO
         // (FIFO semantics for O_WRONLY|O_NONBLOCK) rather than blocking the
-        // emulation thread; we just retry on the next buffer.
+        // emulation thread; we just retry (at most every 500ms, above) on a
+        // later buffer.
         g_native_audio_fifo_fd = open(g_native_audio_fifo_path,
                                        O_WRONLY | O_NONBLOCK);
         if (g_native_audio_fifo_fd < 0) {
