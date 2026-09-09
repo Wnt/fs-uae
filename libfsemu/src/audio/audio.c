@@ -105,8 +105,23 @@ void fse_init_audio(void)
 {
     fs_log("[AUDIO] Initialize\n");
 
+    /* kernel-hive native-fixes #3: FSUAE_NATIVE_AUDIO_FIFO names a FIFO the
+     * streamhost daemon reads PCM from (src/od-fs/audio.cpp's
+     * native_audio_fifo_write(), fed from send_sound() regardless of which
+     * fse_audio backend is registered here). A host-native station has no
+     * OS audio device to bridge to, so opening OpenAL under the knob only
+     * bought a device that logs "openal error 40964 (alSourcePlay)" / "no
+     * audio buffer available - dropping data" every frame forever, since
+     * nothing ever calls alSourcePlay on it via this path -- the dummy
+     * backend is the exact fit: same fse_audio vtable shape, no-op device,
+     * mixer and the FIFO producer above are untouched either way. Unset,
+     * this branch is not taken and behaviour is byte-identical to before. */
     const char *driver = fs_config_get_const_string(OPTION_AUDIO_DRIVER);
-    if (0) {
+    if (getenv("FSUAE_NATIVE_AUDIO_FIFO")) {
+        fs_log("[AUDIO] FSUAE_NATIVE_AUDIO_FIFO set: skipping OpenAL, "
+               "using dummy audio device\n");
+        fse_init_dummy_audio();
+    } else if (0) {
 #ifdef WITH_OPENAL
     } else if (!driver || strcmp(driver, "openal") == 0) {
         fse_init_openal_audio();
