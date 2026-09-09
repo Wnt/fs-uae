@@ -29,6 +29,7 @@
 #include <strings.h>
 #include <locale.h>
 #include "fs-uae.h"
+#include "native.h"
 #include "recording.h"
 #include "plugins.h"
 #include "options.h"
@@ -357,7 +358,12 @@ static void event_handler(int line)
 
     //fs_emu_lua_run_handler("on_fs_uae_frame_start");
 
-    fs_emu_wait_for_frame(g_fs_uae_frame);
+    if (fsuae_native_enabled()) {
+        /* libfsemu's limiter belongs to the video main loop we do not run. */
+        fsuae_native_wait_for_frame();
+    } else {
+        fs_emu_wait_for_frame(g_fs_uae_frame);
+    }
     if (g_fs_uae_frame == 1) {
         if (!fs_emu_netplay_enabled()) {
             if (fs_config_true(OPTION_WARP_MODE)) {
@@ -1305,7 +1311,11 @@ int main(int argc, char *argv[])
     fs_emu_set_pause_function(pause_function);
 
     //fs_uae_init_input();
-    fse_init(FS_EMU_INIT_EVERYTHING);
+    /* Host-native: everything except the video subsystem, which is what opens
+     * the window and creates the GL context. Input and audio init stay -- the
+     * core's own wiring runs through them. */
+    fse_init(fsuae_native_enabled() ? (FS_EMU_INIT_EVERYTHING & ~FS_EMU_INIT_VIDEO)
+                                    : FS_EMU_INIT_EVERYTHING);
 
     // we initialize the recording module either it is used or not, so it
     // can delete state-specific recordings (if necessary) when states are
@@ -1407,7 +1417,15 @@ int main(int argc, char *argv[])
             fs_emu_get_windowed_height());
     amiga_add_rtg_resolution(fs_emu_get_fullscreen_width(),
             fs_emu_get_fullscreen_height());
-    fs_uae_init_video();
+    if (fsuae_native_enabled()) {
+        /* Host-native owns the render buffer and the render callback outright;
+         * fs_uae_init_video() would allocate libfsemu video buffers and install
+         * render_screen()/display_screen(), both of which lead back into the
+         * GL renderer we are not running. */
+        fsuae_native_init_video();
+    } else {
+        fs_uae_init_video();
+    }
 
     //fs_uae_init_keyboard();
     fs_uae_init_mouse();
@@ -1421,7 +1439,11 @@ int main(int argc, char *argv[])
         }
     }
 
-    fs_emu_run(main_function);
+    if (fsuae_native_enabled()) {
+        fsuae_native_run(main_function);
+    } else {
+        fs_emu_run(main_function);
+    }
     fs_log("fs-uae shutting down, fs_emu_run returned\n");
     if (g_rmdir(fs_uae_state_dir()) == 0) {
         fs_log("state dir %s was removed because it was empty\n",

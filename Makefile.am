@@ -145,6 +145,8 @@ fs_uae_SOURCES = \
 	src/fs-uae/keyboard.c \
 	src/fs-uae/main.c \
 	src/fs-uae/menu.c \
+	src/fs-uae/native.c \
+	src/fs-uae/native.h \
 	src/fs-uae/mouse.c \
 	src/fs-uae/options.h \
 	src/fs-uae/paths.c \
