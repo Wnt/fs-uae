@@ -79,6 +79,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,6 +89,52 @@
 #include <unistd.h>
 
 #include <uae/uae.h>
+
+/*
+ * kernel-hive native-fixes #2: clean SIGTERM.
+ *
+ * The headless launcher previously had no way to ask the emulation loop to
+ * stop; a SIGTERM went unhandled (the default disposition happens to be
+ * "terminate", so the process DID die, but only via the kernel tearing the
+ * process down mid-frame -- no flush of the shm header, no chance to close
+ * the audio FIFO cleanly, and observed as taking long enough in practice that
+ * the launcher escalated to SIGKILL after a 10s grace period, making every
+ * reset cost 10s). uae_quit() (src/main.cpp) is the same "clean stop" path
+ * uae_restart()/the GUI quit button already use: it sets quit_program, which
+ * every core loop iteration (handle_events()/m68k exec) checks and unwinds
+ * from, so amiga_main() returns normally and main_function() (src/fs-uae/
+ * main.c) falls through into fs-uae's ordinary shutdown code.
+ *
+ * uae_quit() is C++-mangled (main.cpp), so this C file cannot call it
+ * directly; fsuae_native_quit() (src/od-fs/ctlsock.cpp) is a one-line
+ * extern "C" wrapper.
+ *
+ * The handler itself only sets a volatile flag -- async-signal-safety rules
+ * out calling uae_quit() (which logs and touches non-trivial state) from
+ * signal context. fsuae_native_wait_for_frame() polls the flag once per
+ * emulated frame (every ~16-20ms at 50-60Hz), which is what keeps the "exit
+ * within ~1s of SIGTERM" bound comfortably inside one frame period rather
+ * than needing a dedicated poll thread.
+ */
+extern void fsuae_native_quit(void);
+
+static volatile sig_atomic_t g_native_term_requested = 0;
+
+static void native_sigterm_handler(int signum)
+{
+    (void) signum;
+    g_native_term_requested = 1;
+}
+
+static void native_install_signal_handlers(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = native_sigterm_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;   /* no SA_RESTART: EINTR is fine, we don't block on I/O here */
+    sigaction(SIGTERM, &sa, NULL);
+}
 
 #define SHM_HEADER 64
 #define SHM_MAGIC 0x31424649u /* 'IFB1' */
@@ -341,6 +388,16 @@ void fsuae_native_wait_for_frame(void)
     if (!fsuae_native_enabled()) {
         return;
     }
+    if (g_native_term_requested) {
+        /* Request the core's own clean-quit path exactly once; further
+         * frames may still elapse while amiga_main() unwinds, so keep this
+         * idempotent rather than re-signalling every frame. */
+        g_native_term_requested = 0;
+        if (g_trace) {
+            fprintf(stderr, "[fsuae-shm] SIGTERM: requesting clean quit\n");
+        }
+        fsuae_native_quit();
+    }
     /* The chipset refresh rate is whatever the core is currently running at --
      * PAL 50, NTSC ~60, and -1 while warp mode is on. Re-read it every frame so
      * a mode switch repaces us instead of desynchronising. */
@@ -379,6 +436,7 @@ void fsuae_native_wait_for_frame(void)
 int fsuae_native_run(void (*main_function)(void))
 {
     fprintf(stderr, "[fsuae-shm] host-native run: no window, no GL, no X\n");
+    native_install_signal_handlers();
     main_function();
     return 0;
 }
