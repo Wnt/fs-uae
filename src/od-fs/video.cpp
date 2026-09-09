@@ -252,10 +252,29 @@ static bool render_frame(bool immediate)
 #if 0
     printf("%0.2f\n", g_renderdata.refresh_rate);
 #endif
-    g_fsuae_ctl_crop_x = g_renderdata.limit_x;
-    g_fsuae_ctl_crop_y = g_renderdata.limit_y;
-    g_fsuae_ctl_crop_w = g_renderdata.limit_w;
-    g_fsuae_ctl_crop_h = g_renderdata.limit_h;
+    /* kernel-hive (integration): ONE crop rect for both native planes. The shm
+     * publisher (src/fs-uae/native.c) shows exactly this rectangle and the
+     * ctlsock states MOVEA/screen=WxH in exactly this pixel space, so it is
+     * normalized to hires/laced pixels and clamped here, once, and read by
+     * both. Mirrors src/fs-uae/video.c:466-475. */
+    {
+        int hshift = (g_renderdata.flags & AMIGA_VIDEO_LOW_RESOLUTION) ? 1 : 0;
+        int vshift = (!(g_renderdata.flags & AMIGA_VIDEO_LINE_DOUBLING)) ? 1 : 0;
+        int cx = g_renderdata.limit_x << hshift;
+        int cw = g_renderdata.limit_w << hshift;
+        int cy = g_renderdata.limit_y << vshift;
+        int ch = g_renderdata.limit_h << vshift;
+        if (cx < 0) cx = 0;
+        if (cy < 0) cy = 0;
+        if (cw <= 0 || cx + cw > g_renderdata.width) cw = g_renderdata.width - cx;
+        if (ch <= 0 || cy + ch > g_renderdata.height) ch = g_renderdata.height - cy;
+        if (cw < 0) cw = 0;
+        if (ch < 0) ch = 0;
+        g_fsuae_ctl_crop_x = cx;
+        g_fsuae_ctl_crop_y = cy;
+        g_fsuae_ctl_crop_w = cw;
+        g_fsuae_ctl_crop_h = ch;
+    }
 
     if (g_libamiga_callbacks.render) {
         g_libamiga_callbacks.render(&g_renderdata);

@@ -184,30 +184,21 @@ static int native_ensure_mapped(int w, int h)
     return 1;
 }
 
-/* The crop rectangle the core wants shown, normalized to hires/laced pixels and
- * clamped into the allocated buffer. Mirrors src/fs-uae/video.c:466-475; RTG
- * (Picasso96) frames already arrive at their true size with both shifts zero. */
+/* The crop rectangle the core wants shown. Since the input plane merged, this
+ * rect is computed ONCE per frame in src/od-fs/video.cpp (render_frame, just
+ * before this callback runs) and exported through g_fsuae_ctl_crop_*, so the
+ * pixels published here and the coordinate space the ctlsock accepts MOVEA in
+ * are the same rectangle by construction and cannot drift apart. */
+extern int g_fsuae_ctl_crop_x, g_fsuae_ctl_crop_y;
+extern int g_fsuae_ctl_crop_w, g_fsuae_ctl_crop_h;
+
 static void native_crop(RenderData *rd, int *cx, int *cy, int *cw, int *ch)
 {
-    int hshift = (rd->flags & AMIGA_VIDEO_LOW_RESOLUTION) ? 1 : 0;
-    int vshift = (!(rd->flags & AMIGA_VIDEO_LINE_DOUBLING)) ? 1 : 0;
-
-    int x = rd->limit_x << hshift;
-    int w = rd->limit_w << hshift;
-    int y = rd->limit_y << vshift;
-    int h = rd->limit_h << vshift;
-
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (w <= 0 || x + w > rd->width) w = rd->width - x;
-    if (h <= 0 || y + h > rd->height) h = rd->height - y;
-    if (w < 0) w = 0;
-    if (h < 0) h = 0;
-
-    *cx = x;
-    *cy = y;
-    *cw = w;
-    *ch = h;
+    (void) rd;
+    *cx = g_fsuae_ctl_crop_x;
+    *cy = g_fsuae_ctl_crop_y;
+    *cw = g_fsuae_ctl_crop_w;
+    *ch = g_fsuae_ctl_crop_h;
 }
 
 static double g_render_hz = 0.0;
