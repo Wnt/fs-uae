@@ -524,6 +524,7 @@ libuae_a_SOURCES = \
 	src/od-fs/include/uae/uae_inputevents_def.h \
 	src/od-fs/include/win32gfx.h \
 	src/od-fs/include/win32gui.h \
+	src/od-fs/ctlsock.cpp \
 	src/od-fs/input.cpp \
 	src/od-fs/inputrecord.cpp \
 	src/od-fs/ioport.cpp \
