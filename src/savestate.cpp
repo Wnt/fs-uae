@@ -62,6 +62,7 @@
 #include "audio.h"
 #include "filesys.h"
 #include "inputrecord.h"
+#include "inputdevice.h"
 #include "disk.h"
 #include "threaddep/thread.h"
 #include "a2091.h"
@@ -783,6 +784,7 @@ void savestate_restore_finish (void)
 	savestate_state = 0;
 	init_hz_normal();
 	audio_activate();
+	mousehack_rearm_from_env ();
 #ifdef FSUAE
     uae_callback(uae_on_restore_state_finished, savestate_fname);
 #endif

@@ -2016,6 +2016,30 @@ static bool mousehack_enable (void)
 	return true;
 }
 
+void mousehack_rearm_from_env (void)
+{
+#ifdef FSUAE
+	/* kernel-hive: a savestate restore runs customreset -> mousehack_reset(),
+	 * zeroing mousehack_address; the restored guest never re-issues the
+	 * mode-5 registration trap, so absolute mouse (mousehack) stays dead.
+	 * The guest-side MH block in the restored RAM is still armed, so
+	 * re-arming the two host statics is sufficient. The address is stable
+	 * for a given golden statefile; harvested from the mode-5 log line. */
+	const char *e = getenv ("FS_UAE_MOUSEHACK_ADDR");
+	if (e && e[0]) {
+		uaecptr a = (uaecptr) strtoul (e, NULL, 16);
+		if (a && valid_address (a + MH_E, 1) && (get_byte (a + MH_E) & 0x80)) {
+			mousehack_address = a;
+			mousehack_enabled = true;
+			mousehack_alive_cnt = 100;
+			write_log (_T("mousehack re-armed from env at %08x\n"), a);
+		} else {
+			write_log (_T("mousehack re-arm: env addr %08x invalid or disarmed\n"), a);
+		}
+	}
+#endif
+}
+
 static void inputdevice_update_tablet_params(void)
 {
 	uae_u8 *p;
@@ -2066,6 +2090,7 @@ int input_mousehack_status (int mode, uaecptr diminfo, uaecptr dispinfo, uaecptr
 		return mousehack_enable () ? 1 : 0;
 	} else if (mode == 5) {
 		mousehack_address = m68k_dreg (regs, 0);
+		write_log (_T("mousehack registered at %08x\n"), mousehack_address);
 		mousehack_enable ();
 		inputdevice_update_tablet_params ();
 	} else if (mode == 0) {

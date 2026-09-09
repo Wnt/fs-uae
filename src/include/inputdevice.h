@@ -224,6 +224,7 @@ extern int magicmouse_alive (void);
 extern int is_tablet (void);
 extern int inputdevice_is_tablet (void);
 extern int input_mousehack_status (int mode, uaecptr diminfo, uaecptr dispinfo, uaecptr vp, uae_u32 moffset);
+extern void mousehack_rearm_from_env (void);
 extern void input_mousehack_mouseoffset (uaecptr pointerprefs);
 extern int mousehack_alive (void);
 extern void mousehack_wakeup(void);
