@@ -1,4 +1,5 @@
 #include "sysconfig.h"
+#include "ctlsock.h"
 #include "sysdeps.h"
 
 #include "custom.h"
@@ -173,6 +174,10 @@ bool handle_events (void) {
     if (g_libamiga_callbacks.event) {
         g_libamiga_callbacks.event(-1);
     }
+
+    /* kernel-hive: the ctlsock reader thread only enqueues; every injection
+     * runs here, on the UAE core thread, once per emulated frame. */
+    fsuae_ctlsock_poll();
 
     //frame_wait_for_filesys();
     //filesys_handle_events();

@@ -140,6 +140,12 @@ void flush_screen (struct vidbuffer *buffer, int first_line, int last_line) {
 }
 
 
+/* kernel-hive: the published crop rect, refreshed every frame so the ctlsock
+ * can translate a MOVEA stated in published-frame pixels back into the native
+ * buffer, and re-advertise screen=WxH when the mode changes. */
+int g_fsuae_ctl_crop_x = 0, g_fsuae_ctl_crop_y = 0;
+int g_fsuae_ctl_crop_w = 0, g_fsuae_ctl_crop_h = 0;
+
 bool target_graphics_buffer_update (void) {
     write_log("target_graphics_buffer_update - clearing buffer\n");
     memset(g_renderdata.pixels, 0, \
@@ -246,6 +252,11 @@ static bool render_frame(bool immediate)
 #if 0
     printf("%0.2f\n", g_renderdata.refresh_rate);
 #endif
+    g_fsuae_ctl_crop_x = g_renderdata.limit_x;
+    g_fsuae_ctl_crop_y = g_renderdata.limit_y;
+    g_fsuae_ctl_crop_w = g_renderdata.limit_w;
+    g_fsuae_ctl_crop_h = g_renderdata.limit_h;
+
     if (g_libamiga_callbacks.render) {
         g_libamiga_callbacks.render(&g_renderdata);
     }
@@ -611,9 +622,19 @@ static int init_colors (void)
 }
 
 #include <fs/emu/hacks.h>
+#include "ctlsock.h"
 
 void getgfxoffset (float *dxp, float *dyp, float *mxp, float *myp)
 {
+    /* kernel-hive: fs_emu_video_offset_* / fs_emu_video_scale_* are libfsemu
+     * RENDERER state -- meaningful only because the SDL renderer sets them.
+     * With the ctlsock armed the daemon states absolute targets in the
+     * published frame's own pixel space, so the transform must be identity or
+     * mousehack_helper() scales an already-correct coordinate. */
+    if (fsuae_ctlsock_enabled()) {
+        *dxp = 0.0f; *dyp = 0.0f; *mxp = 1.0f; *myp = 1.0f;
+        return;
+    }
     /* Offset and scale factors used for magic mouse (in order to translate
      * mouse coordinates to Amiga coordinates) */
     *dxp = fs_emu_video_offset_x;
